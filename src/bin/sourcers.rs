@@ -17,6 +17,9 @@ use byteorder::ReadBytesExt;
 use clap::Parser;
 use std::path::PathBuf;
 
+use sourcers::object;
+use anyhow::Result;
+
 #[derive(clap::ValueEnum,Default,Clone)]
 enum OutputType {
     #[default]
@@ -24,6 +27,15 @@ enum OutputType {
     Asm,
     /// Map file, suitable for analysis
     Map
+}
+
+#[derive(clap::ValueEnum,Default,Clone)]
+enum InputType {
+    #[default]
+    /// Raw binary
+    Raw,
+    /// Object file
+    Object
 }
 
 #[derive(clap::ValueEnum,Default,Clone,PartialEq)]
@@ -43,6 +55,9 @@ struct Cli {
     #[clap(long, default_value_t, value_enum)]
     /// Output file format
     format: OutputType,
+    #[clap(long, default_value_t, value_enum)]
+    /// Input file format
+    r#type: InputType,
     #[clap(long, default_value_t, value_enum)]
     /// Number of bits in the input format
     bits: Bits,
@@ -523,12 +538,31 @@ fn output_segment(args: &Cli, cs: &Capstone, seg: &Segment, markers: &MarkerMap)
     println!("                     end");
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Cli::parse();
 
-    let mut seg = Segment::new("seg_a".to_string());
-    seg.data = std::fs::read(&args.input).unwrap();
-    seg.base = 0;
+    let file_content = std::fs::read(&args.input).unwrap();
+
+    let mut segments: Vec<Segment> = Vec::new();
+    match args.r#type {
+        InputType::Raw => {
+            let mut seg = Segment::new("seg_a".to_string());
+            seg.data = file_content;
+            seg.base = 0;
+            segments.push(seg);
+        },
+        InputType::Object => {
+            let object = object::Object::new(&file_content)?;
+            for obj_seg in &object.segments {
+                let segment_name = &object.names[obj_seg.name_index];
+                let mut seg = Segment::new(segment_name.to_string());
+                seg.data = obj_seg.data.clone();
+                seg.base = 0;
+                segments.push(seg);
+            }
+        }
+    };
+
     let mode = match args.bits {
         Bits::Bits16 => arch::x86::ArchMode::Mode16,
         Bits::Bits32 => arch::x86::ArchMode::Mode32,
@@ -541,12 +575,15 @@ fn main() {
         .build()
         .unwrap();
 
-    let insns = cs
-        .disasm_all(&seg.data, seg.base)
-        .unwrap();
+    for seg in &segments {
+        let insns = cs
+            .disasm_all(&seg.data, seg.base)
+            .unwrap();
 
-    let mut markers = HashMap::<u64, Marker>::new();
-    step1(&cs, &seg, &insns, &mut markers);
+        let mut markers = HashMap::<u64, Marker>::new();
+        step1(&cs, &seg, &insns, &mut markers);
 
-    output_segment(&args, &cs, &seg, &mut markers);
+        output_segment(&args, &cs, &seg, &mut markers);
+    }
+    Ok(())
 }
