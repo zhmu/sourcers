@@ -65,15 +65,47 @@ struct Cli {
     input: PathBuf
 }
 
+#[derive(Debug)]
+enum Reference {
+    SegmentDisplacement(usize, u32),
+    Segment(usize),
+    Group(usize),
+    External(usize),
+}
+
+#[derive(Debug)]
+struct External {
+    name: String,
+}
+
+#[derive(Debug)]
+struct Group {
+    name: String,
+    segments: Vec<usize>,
+}
+
 struct Segment {
     name: String,
     base: u64,
-    data: Vec<u8>
+    data: Vec<u8>,
+    references: HashMap<u64, Reference>,
 }
 
 impl Segment {
     fn new(name: String) -> Self {
-        Self{ name, base: 0, data: Vec::new() }
+        Self{ name, base: 0, data: Vec::new(), references: HashMap::new() }
+    }
+}
+
+struct Target {
+    segments: Vec<Segment>,
+    externals: Vec<External>,
+    groups: Vec<Group>,
+}
+
+impl Target {
+    fn new() -> Self {
+        Self{segments: Vec::new(), externals: Vec::new(), groups: Vec::new() }
     }
 }
 
@@ -101,12 +133,12 @@ fn get_op_imm(op: &capstone::arch::x86::X86Operand) -> Option<u64> {
     }
 }
 
-fn generate_code_label(offset: u64) -> String {
-    format!("loc_{:04x}", offset)
+fn generate_code_label(seg: &Segment, offset: u64) -> String {
+    format!("loc_{}_{:04x}", seg.name, offset)
 }
 
-fn generate_data_label(offset: u64) -> String {
-    format!("data_{:04x}", offset)
+fn generate_data_label(seg: &Segment, offset: u64) -> String {
+    format!("data_{}_{:04x}", seg.name, offset)
 }
 
 fn format_value(value: i64) -> String {
@@ -153,17 +185,61 @@ fn determine_op_prefix(ops: &[capstone::arch::ArchOperand]) -> String {
     }
 }
 
-fn format_operand(cs: &Capstone, markers: &MarkerMap, ops: &[capstone::arch::ArchOperand], op: &capstone::arch::x86::X86Operand) -> String {
+fn lookup_reference<'a>(seg: &'a Segment, insn: &capstone::Insn) -> Option<&'a Reference> {
+    // TODO: How to get the address of the operand??
+    let insns_base = insn.address() - seg.base;
+
+    let mut result: Vec<&Reference> = Vec::new();
+    for n in insns_base..(insns_base + insn.bytes().len() as u64)  {
+        if let Some(refe) = seg.references.get(&n) {
+            result.push(refe);
+        }
+    }
+
+    if result.is_empty() { return None; }
+    if result.len() > 1 {
+        todo!("matched multiple references {:?}", result);
+    }
+    return Some(result[0]);
+}
+
+fn format_reference(target: &Target, refe: &Reference) -> String {
+    match refe {
+        Reference::SegmentDisplacement(seg_idx, disp) => {
+            // TODO We have no way of knowing whether this is a code/data reference...
+            let seg = &target.segments[*seg_idx];
+            generate_data_label(seg, *disp as u64)
+        },
+        Reference::Segment(seg_idx) => {
+            let seg = &target.segments[*seg_idx];
+            format!("{}", seg.name)
+        },
+        Reference::Group(group_idx) => {
+            let group = &target.groups[*group_idx];
+            format!("{}", group.name)
+        },
+        Reference::External(ext_idx) => {
+            let ext = &target.externals[*ext_idx];
+            format!("{}", ext.name)
+        }
+    }
+}
+
+fn format_operand(cs: &Capstone, target: &Target, seg: &Segment, insn: &capstone::Insn, markers: &MarkerMap, ops: &[capstone::arch::ArchOperand], op: &capstone::arch::x86::X86Operand) -> String {
     match op.op_type {
         X86OperandType::Reg(r) =>  {
             let r = cs.reg_name(r).unwrap();
             format!("{}", r)
         },
         X86OperandType::Imm(i) => {
-            format!("{}", format_value(i as i64))
+            if let Some(refe) = lookup_reference(seg, insn) {
+                format!("{}", format_reference(target, refe))
+            } else {
+                format!("{}", format_value(i as i64))
+            }
         },
         X86OperandType::Mem(m) => {
-            let seg = m.segment();
+            let seg_reg = m.segment();
             let base = m.base();
             let index = m.index();
             let scale = m.scale();
@@ -172,8 +248,8 @@ fn format_operand(cs: &Capstone, markers: &MarkerMap, ops: &[capstone::arch::Arc
 
             let mut args = determine_op_prefix(ops);
 
-            if seg != RegId::INVALID_REG {
-                let r = cs.reg_name(seg).unwrap();
+            if seg_reg != RegId::INVALID_REG {
+                let r = cs.reg_name(seg_reg).unwrap();
                 write!(args, "{}:", r).unwrap();
             }
             args += "[";
@@ -196,6 +272,14 @@ fn format_operand(cs: &Capstone, markers: &MarkerMap, ops: &[capstone::arch::Arc
                     write!(addr, "{}", format_value(disp)).unwrap();
                 }
             }
+
+            if let Some(refe) = lookup_reference(seg, insn) {
+                // TODO How do we properly integrate this?
+                // Now we can have things like
+                // "mov  word ptr [data_ASSEMBLY_0c35si+data_ASSEMBLY_001b],data_ASSEMBLY_0c35"
+                // And we should not add the initial data_ASSEMBLY_0c35 here...
+                args += &format!("{}", format_reference(target, refe));
+            }
             args += &addr;
             args += "]";
             args
@@ -217,7 +301,7 @@ fn find_label(markers: &MarkerMap, offset: u64) -> Option<&String> {
     None
 }
 
-fn format_instruction(cs: &Capstone, i: &capstone::Insn, markers: &MarkerMap) -> String {
+fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capstone::Insn, markers: &MarkerMap) -> String {
     let detail: InsnDetail = cs.insn_detail(&i).expect("Failed to get insn detail");
     let arch_detail: ArchDetail = detail.arch_detail();
     let ops = arch_detail.operands();
@@ -233,13 +317,13 @@ fn format_instruction(cs: &Capstone, i: &capstone::Insn, markers: &MarkerMap) ->
                 write!(args, "{}", format_value(value as i64)).unwrap();
             }
         } else {
-            args += &format_operand(cs, markers, &ops, get_x86_op(&ops[0]));
+            args += &format_operand(cs, target, seg, i, markers, &ops, get_x86_op(&ops[0]));
         }
     } else {
         for op in &ops {
             if !args.is_empty() { args += ","; }
             let op = get_x86_op(&op);
-            args += &format_operand(cs, markers, &ops, &op);
+            args += &format_operand(cs, target, seg, i, markers, &ops, &op);
         }
     }
     format!("{:4} {}", i.mnemonic().unwrap(), args)
@@ -287,7 +371,7 @@ fn isolate_data_op(seg: &Segment, op: &capstone::arch::x86::X86Operand) -> Optio
 
             if disp >= seg.data.len() as u64 { return None; }
 
-            let label = generate_data_label(disp);
+            let label = generate_data_label(seg, disp);
             if base != RegId::INVALID_REG {
                 // Relative to some address, with a base address
                 return Some((disp, Marker::DataIndexed(label, op.size)));
@@ -321,7 +405,7 @@ fn step1<'a>(cs: &Capstone, seg: &Segment, insns: &capstone::Instructions<'a>, m
             assert!(ops.len() == 1);
             if let Some(value) = get_op_imm(get_x86_op(&ops[0])) {
                 info!("Branch {:x}", value);
-                markers.insert(value, Marker::CodeLabel(generate_code_label(value)));
+                markers.insert(value, Marker::CodeLabel(generate_code_label(seg, value)));
                 continue;
             }
         }
@@ -390,7 +474,7 @@ fn step1<'a>(cs: &Capstone, seg: &Segment, insns: &capstone::Instructions<'a>, m
     }
 }
 
-fn print_code(args: &Cli, cs: &Capstone, seg: &Segment, code: &[u8], cur_offs: u64, markers: &MarkerMap) {
+fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &[u8], cur_offs: u64, markers: &MarkerMap) {
     let code_base = seg.base + cur_offs;
     let insns = cs
         .disasm_all(code, code_base)
@@ -406,7 +490,7 @@ fn print_code(args: &Cli, cs: &Capstone, seg: &Segment, code: &[u8], cur_offs: u
         // let arch_detail: ArchDetail = detail.arch_detail();
         // let ops = arch_detail.operands();
 
-        let s = format_instruction(&cs, &i, &markers);
+        let s = format_instruction(&cs, target, seg, &i, &markers);
         //print_instr(i, &arch_detail);
         match args.format {
             OutputType::Asm => {
@@ -486,7 +570,7 @@ fn print_data(args: &Cli, data: &[u8], cur_offset: u64, size: u64) {
     print_data(&args, &data[rdr.position() as usize..], cur_offset + rdr.position(), 1);
 }
 
-fn output_segment(args: &Cli, cs: &Capstone, seg: &Segment, markers: &MarkerMap) {
+fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, markers: &MarkerMap) {
     println!("{:12}    segment byte public", seg.name);
     println!("                assume  cs:{}, ds:{}, es:{}, fs:{}, gs:{}",
         seg.name, seg.name, seg.name, seg.name, seg.name);
@@ -518,7 +602,7 @@ fn output_segment(args: &Cli, cs: &Capstone, seg: &Segment, markers: &MarkerMap)
         let (next_offs, _next_marker) = &flat_map[n+1];
         if cur_marker.is_code() {
             let code = &seg.data[*cur_offs as usize..*next_offs as usize];
-            print_code(&args, &cs, &seg, &code, *cur_offs, &markers);
+            print_code(&args, &cs, target, &seg, &code, *cur_offs, &markers);
         } else if cur_marker.is_data() {
             if let Some(label) = find_label(&markers, *cur_offs) {
                 println!("{}:", label);
@@ -543,13 +627,13 @@ fn main() -> Result<()> {
 
     let file_content = std::fs::read(&args.input).unwrap();
 
-    let mut segments: Vec<Segment> = Vec::new();
+    let mut target = Target::new();
     match args.r#type {
         InputType::Raw => {
             let mut seg = Segment::new("seg_a".to_string());
             seg.data = file_content;
             seg.base = 0;
-            segments.push(seg);
+            target.segments.push(seg);
         },
         InputType::Object => {
             let object = object::Object::new(&file_content)?;
@@ -558,7 +642,38 @@ fn main() -> Result<()> {
                 let mut seg = Segment::new(segment_name.to_string());
                 seg.data = obj_seg.data.clone();
                 seg.base = 0;
-                segments.push(seg);
+                target.segments.push(seg);
+            }
+            for external in &object.externals {
+                target.externals.push(External{
+                    name: external.name.clone()
+                });
+            }
+            for group in &object.groups {
+                let group_name = &object.names[group.name_index];
+                target.groups.push(Group{
+                    name: group_name.to_string(),
+                    segments: group.seg_indices.clone()
+                });
+            }
+            for (seg_index, obj_seg) in object.segments.iter().enumerate() {
+                let seg = &mut target.segments[seg_index];
+                for (addr, fixup) in &obj_seg.fixups {
+                    match fixup.target_fixup {
+                        object::TargetFixup::SegmentIndexAndDisplacement(seg_idx, disp) => {
+                            seg.references.insert(*addr as u64, Reference::SegmentDisplacement(seg_idx, disp as u32));
+                        },
+                        object::TargetFixup::SegmentIndexOnly(seg_idx) => {
+                            seg.references.insert(*addr as u64, Reference::Segment(seg_idx));
+                        },
+                        object::TargetFixup::GroupIndexOnly(group_idx) => {
+                            seg.references.insert(*addr as u64, Reference::Group(group_idx));
+                        },
+                        object::TargetFixup::ExternalIndex(ext_idx) => {
+                            seg.references.insert(*addr as u64, Reference::External(ext_idx));
+                        },
+                    }
+                }
             }
         }
     };
@@ -575,7 +690,20 @@ fn main() -> Result<()> {
         .build()
         .unwrap();
 
-    for seg in &segments {
+    for external in &target.externals {
+        println!("EXTRN {}:BYTE", external.name);
+    }
+
+    for group in &target.groups {
+        let mut segs = String::new();
+        for seg_idx in &group.segments {
+            if !segs.is_empty() { segs += " "; }
+            segs += &target.segments[*seg_idx].name;
+        }
+        println!("{} GROUP {}", group.name, segs);
+    }
+
+    for seg in &target.segments {
         let insns = cs
             .disasm_all(&seg.data, seg.base)
             .unwrap();
@@ -583,7 +711,7 @@ fn main() -> Result<()> {
         let mut markers = HashMap::<u64, Marker>::new();
         step1(&cs, &seg, &insns, &mut markers);
 
-        output_segment(&args, &cs, &seg, &mut markers);
+        output_segment(&args, &cs, &target, &seg, &mut markers);
     }
     Ok(())
 }
