@@ -15,6 +15,7 @@ use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 
 use clap::Parser;
+use clap_num::maybe_hex;
 use std::path::PathBuf;
 
 use sourcers::object;
@@ -61,6 +62,9 @@ struct Cli {
     #[clap(long, default_value_t, value_enum)]
     /// Number of bits in the input format
     bits: Bits,
+    #[clap(long, default_value_t=0, value_parser=maybe_hex::<u64>)]
+    /// Base of file in memory
+    base: u64,
     /// Input file
     input: PathBuf
 }
@@ -474,8 +478,7 @@ fn step1<'a>(cs: &Capstone, seg: &Segment, insns: &capstone::Instructions<'a>, m
     }
 }
 
-fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &[u8], cur_offs: u64, markers: &MarkerMap) {
-    let code_base = seg.base + cur_offs;
+fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &[u8], code_base: u64, markers: &MarkerMap) {
     let insns = cs
         .disasm_all(code, code_base)
         .expect("Failed to disassemble");
@@ -517,7 +520,7 @@ fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &
     }
 
     if last_offset < code.len() {
-        print_data(args, &code[last_offset..], cur_offs + last_offset as u64, 1);
+        print_data(args, &code[last_offset..], code_base + last_offset as u64, 1);
     }
 }
 
@@ -581,7 +584,7 @@ fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, mar
     // Ensure only items in range survive
     let mut flat_map: Vec<(u64, Marker)> = Vec::new();
 
-    let initial_marker = (0, Marker::CodeLabel("<initial-marker>".to_string()));
+    let initial_marker = (seg.base, Marker::CodeLabel("<initial-marker>".to_string()));
     if let Some(_) = markers.get(&0) {
         // There's an initial marker - overwrite it in the result
         initial_map[0] = initial_marker;
@@ -595,13 +598,13 @@ fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, mar
         }
     }
     // Always insert a dummy final argument so the loop covers the entire segment
-    flat_map.push((seg.data.len() as u64, Marker::CodeLabel("<dummy-end-marker>".to_string())));
+    flat_map.push((seg.data.len() as u64 + seg.base, Marker::CodeLabel("<dummy-end-marker>".to_string())));
 
     for n in 0..flat_map.len() - 1 {
         let (cur_offs, cur_marker) = &flat_map[n];
         let (next_offs, _next_marker) = &flat_map[n+1];
         if cur_marker.is_code() {
-            let code = &seg.data[*cur_offs as usize..*next_offs as usize];
+            let code = &seg.data[(*cur_offs - seg.base) as usize..(*next_offs - seg.base) as usize];
             print_code(&args, &cs, target, &seg, &code, *cur_offs, &markers);
         } else if cur_marker.is_data() {
             if let Some(label) = find_label(&markers, *cur_offs) {
@@ -632,7 +635,7 @@ fn main() -> Result<()> {
         InputType::Raw => {
             let mut seg = Segment::new("seg_a".to_string());
             seg.data = file_content;
-            seg.base = 0;
+            seg.base = args.base;
             target.segments.push(seg);
         },
         InputType::Object => {
