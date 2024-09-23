@@ -18,7 +18,7 @@ use clap::Parser;
 use clap_num::maybe_hex;
 use std::path::PathBuf;
 
-use sourcers::object;
+use sourcers::{object, dos_exe};
 use anyhow::Result;
 
 #[derive(clap::ValueEnum,Default,Clone)]
@@ -36,7 +36,9 @@ enum InputType {
     /// Raw binary
     Raw,
     /// Object file
-    Object
+    Object,
+    /// Executable file (DOS MZ)
+    Exe,
 }
 
 #[derive(clap::ValueEnum,Default,Clone,PartialEq)]
@@ -575,8 +577,7 @@ fn print_data(args: &Cli, data: &[u8], cur_offset: u64, size: u64) {
 
 fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, markers: &MarkerMap) {
     println!("{:12}    segment byte public", seg.name);
-    println!("                assume  cs:{}, ds:{}, es:{}, fs:{}, gs:{}",
-        seg.name, seg.name, seg.name, seg.name, seg.name);
+    println!("                assume  cs:{}, ds:{}", seg.name, seg.name);
 
     let mut initial_map: Vec<(u64, Marker)> = markers.clone().into_iter().collect();
     initial_map.sort_by_key(|v| v.0);
@@ -621,8 +622,8 @@ fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, mar
         }
     }
 
-    println!("{:16}     ends", seg.name);
-    println!("                     end");
+    println!("{:12}    ends", seg.name);
+    println!();
 }
 
 fn main() -> Result<()> {
@@ -678,6 +679,36 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        },
+        InputType::Exe => {
+            let info = dos_exe::DosMzInfo::new(&file_content)?;
+
+            let mut exe_length = (info.header.num_blocks * 512) as usize;
+            if info.header.last_block_used_bytes != 0 {
+                exe_length -= (512 - info.header.last_block_used_bytes) as usize;
+            }
+
+            let payload_start = (info.header.header_size_in_paragraphs * 16) as usize;
+            println!("payload_start {} exe_length {}", payload_start, exe_length);
+            let payload = &file_content[payload_start..exe_length];
+
+            println!("cs:ip {:x}:{:x}", info.header.init_cs, info.header.init_ip);
+
+            // Use the relocations to identify segments containing data
+            let mut offsets: Vec<u16> = info.relocs.iter().map(|r| r.segment * 16).collect();
+            offsets.sort();
+            offsets.dedup();
+            // Add final offset so the length covers everything
+            offsets.push(payload.len() as u16);
+
+            for n in 0..offsets.len() - 1 {
+                let cur_offset = offsets[n] as usize;
+                let next_offset = offsets[n + 1] as usize;
+                let mut seg = Segment::new(format!("seg_{}", n));
+                seg.base = 0;
+                seg.data = payload[cur_offset..next_offset].to_vec();
+                target.segments.push(seg);
+            }
         }
     };
 
@@ -716,5 +747,6 @@ fn main() -> Result<()> {
 
         output_segment(&args, &cs, &target, &seg, &mut markers);
     }
+    println!("                end");
     Ok(())
 }
