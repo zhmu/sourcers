@@ -97,13 +97,20 @@ struct Segment {
     segment: u64,
     offset: u64,
     data: Vec<u8>,
+    labels: Vec<String>,
     references: HashMap<u64, Reference>,
     markers: MarkerMap,
 }
 
 impl Segment {
     fn new(name: String) -> Self {
-        Self{ name, segment: 0, offset: 0, data: Vec::new(), references: HashMap::new(), markers: MarkerMap::new() }
+        Self{ name, segment: 0, offset: 0, data: Vec::new(), labels: Vec::new(), references: HashMap::new(), markers: MarkerMap::new() }
+    }
+
+    fn add_label(&mut self, label: String) -> usize {
+        let num = self.labels.len();
+        self.labels.push(label);
+        num
     }
 }
 
@@ -143,12 +150,19 @@ fn get_op_imm(op: &capstone::arch::x86::X86Operand) -> Option<u64> {
     }
 }
 
-fn generate_code_label(seg: &Segment, offset: u64) -> String {
-    format!("loc_{}_{:04x}", seg.name, offset)
+enum Label {
+    Entry,
+    Code(u64),
+    Data(u64),
 }
 
-fn generate_data_label(seg: &Segment, offset: u64) -> String {
-    format!("data_{}_{:04x}", seg.name, offset)
+fn use_label(seg: &mut Segment, label: Label) -> usize {
+    let label = match label {
+        Label::Entry => "entry".to_string(),
+        Label::Code(offset) => format!("loc_{:x}", offset),
+        Label::Data(offset) => format!("data_{:x}", offset),
+    };
+    seg.add_label(label)
 }
 
 fn format_value(value: i64) -> String {
@@ -220,7 +234,7 @@ fn format_reference(target: &Target, refe: &Reference) -> String {
             // TODO We have no way of knowing whether this is a code/data reference...
             //  ... unless we look at the instruction
             let seg = &target.segments[*seg_idx];
-            generate_data_label(seg, *disp as u64)
+            format!("todo_{}_{:04x}", seg.name, *disp)
         },
         Reference::Segment(seg_idx) => {
             let seg = &target.segments[*seg_idx];
@@ -240,7 +254,7 @@ fn format_reference(target: &Target, refe: &Reference) -> String {
     }
 }
 
-fn format_operand(cs: &Capstone, target: &Target, seg: &Segment, insn: &capstone::Insn, markers: &MarkerMap, ops: &[capstone::arch::ArchOperand], op: &capstone::arch::x86::X86Operand) -> String {
+fn format_operand(cs: &Capstone, target: &Target, seg: &Segment, insn: &capstone::Insn, ops: &[capstone::arch::ArchOperand], op: &capstone::arch::x86::X86Operand) -> String {
     match op.op_type {
         X86OperandType::Reg(r) =>  {
             let r = cs.reg_name(r).unwrap();
@@ -281,7 +295,7 @@ fn format_operand(cs: &Capstone, target: &Target, seg: &Segment, insn: &capstone
             }
             if disp != 0 {
                 if !addr.is_empty() { addr += "+"; }
-                if let Some(label) = find_label(markers, disp as u64) {
+                if let Some(label) = find_label(seg, disp as u64) {
                     write!(addr, "{}", label).unwrap();
                 } else {
                     write!(addr, "{}", format_value(disp)).unwrap();
@@ -305,12 +319,12 @@ fn format_operand(cs: &Capstone, target: &Target, seg: &Segment, insn: &capstone
 
 type MarkerMap = HashMap<u64, Marker>;
 
-fn find_label(markers: &MarkerMap, offset: u64) -> Option<&String> {
-    if let Some(marker) = markers.get(&offset) {
+fn find_label(seg: &Segment, offset: u64) -> Option<&String> {
+    if let Some(marker) = seg.markers.get(&offset) {
         return match marker {
-            Marker::CodeLabel(label) => Some(label),
-            Marker::DataSingle(label, _) => Some(label),
-            Marker::DataIndexed(label, _) => Some(label),
+            Marker::CodeLabel(idx) => Some(&seg.labels[*idx]),
+            Marker::DataSingle(idx, _) => Some(&seg.labels[*idx]),
+            Marker::DataIndexed(idx, _) => Some(&seg.labels[*idx]),
         };
     }
     None
@@ -321,12 +335,12 @@ fn format_instruction_args_default(cs: &Capstone, target: &Target, i: &capstone:
     for op in ops {
         if !args.is_empty() { args += ","; }
         let op = get_x86_op(&op);
-        args += &format_operand(cs, target, seg, i, &seg.markers, &ops, &op);
+        args += &format_operand(cs, target, seg, i, &ops, &op);
     }
     args
 }
 
-fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capstone::Insn, markers: &MarkerMap) -> String {
+fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capstone::Insn) -> String {
     let detail: InsnDetail = cs.insn_detail(&i).expect("Failed to get insn detail");
     let arch_detail: ArchDetail = detail.arch_detail();
     let ops = arch_detail.operands();
@@ -336,13 +350,13 @@ fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capston
     if is_branch(i) {
         assert!(ops.len() == 1);
         if let Some(value) = get_op_imm(get_x86_op(&ops[0])) {
-            if let Some(label) = find_label(markers, value as u64) {
+            if let Some(label) = find_label(seg, value as u64) {
                 write!(args, "{}", label).unwrap();
             } else {
                 write!(args, "{}", format_value(value as i64)).unwrap();
             }
         } else {
-            args += &format_operand(cs, target, seg, i, markers, &ops, get_x86_op(&ops[0]));
+            args += &format_operand(cs, target, seg, i, &ops, get_x86_op(&ops[0]));
         }
     } else {
         match x86_insn::from(i.id().0) {
@@ -353,7 +367,7 @@ fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capston
                     let off = get_op_imm(get_x86_op(&ops[1])).unwrap();
 
                     if let Some(seg) = target.segments.iter().find(|s| s.segment == seg) {
-                        if let Some(label) = find_label(&seg.markers, off) {
+                        if let Some(label) = find_label(seg, off) {
                             args = format!("{},{}", seg.name, label);
                         } else {
                             args = format!("{},{}", seg.name, format_value(off as i64));
@@ -375,11 +389,11 @@ fn format_instruction(cs: &Capstone, target: &Target, seg: &Segment, i: &capston
 
 #[derive(Debug,Clone)]
 enum Marker {
-    CodeLabel(String),
+    CodeLabel(usize),
     /// Single data reference without indexing
-    DataSingle(String, u8),
+    DataSingle(usize, u8),
     /// Indexes data array
-    DataIndexed(String, u8),
+    DataIndexed(usize, u8),
 }
 
 impl Marker {
@@ -398,7 +412,7 @@ impl Marker {
     }
 }
 
-fn isolate_data_op(seg: &Segment, op: &capstone::arch::x86::X86Operand) -> Option<(u64, Marker)> {
+fn isolate_data_op(seg: &mut Segment, op: &capstone::arch::x86::X86Operand) -> Option<(u64, Marker)> {
     match op.op_type {
         X86OperandType::Reg(_r) =>  {
             None
@@ -415,12 +429,12 @@ fn isolate_data_op(seg: &Segment, op: &capstone::arch::x86::X86Operand) -> Optio
 
             if disp >= seg.data.len() as u64 { return None; }
 
-            let label = generate_data_label(seg, disp);
+            let label_idx = use_label(seg, Label::Data(disp));
             if base != RegId::INVALID_REG {
                 // Relative to some address, with a base address
-                return Some((disp, Marker::DataIndexed(label, op.size)));
+                return Some((disp, Marker::DataIndexed(label_idx, op.size)));
             }
-            Some((disp as u64, Marker::DataSingle(label, op.size)))
+            Some((disp as u64, Marker::DataSingle(label_idx, op.size)))
         },
         X86OperandType::Invalid => { unreachable!() }
     }
@@ -517,14 +531,14 @@ fn identify_data<'a>(cs: &Capstone, seg: &mut Segment, insns: &capstone::Instruc
     }
 }
 
-fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &[u8], code_base: u64, markers: &MarkerMap) {
+fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &[u8], code_base: u64) {
     let insns = cs
         .disasm_all(code, code_base)
         .expect("Failed to disassemble");
 
     let mut last_offset: usize = 0;
     for i in insns.as_ref() {
-        if let Some(label) = find_label(&markers, i.address()) {
+        if let Some(label) = find_label(seg, i.address()) {
             println!("{}:", label);
         }
 
@@ -532,7 +546,7 @@ fn print_code(args: &Cli, cs: &Capstone, target: &Target, seg: &Segment, code: &
         // let arch_detail: ArchDetail = detail.arch_detail();
         // let ops = arch_detail.operands();
 
-        let s = format_instruction(&cs, target, seg, &i, &markers);
+        let s = format_instruction(&cs, target, seg, &i);
         //print_instr(i, &arch_detail);
         match args.format {
             OutputType::Asm => {
@@ -624,7 +638,7 @@ fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg_idx: usize) {
     // Ensure only items in range survive
     let mut flat_map: Vec<(u64, Marker)> = Vec::new();
 
-    let initial_marker = (seg.offset, Marker::CodeLabel("<initial-marker>".to_string()));
+    let initial_marker = (seg.offset, Marker::CodeLabel(usize::MAX));
     if let Some(_) = seg.markers.get(&0) {
         // There's an initial marker - overwrite it in the result
         initial_map[0] = initial_marker;
@@ -638,16 +652,16 @@ fn output_segment(args: &Cli, cs: &Capstone, target: &Target, seg_idx: usize) {
         }
     }
     // Always insert a dummy final argument so the loop covers the entire segment
-    flat_map.push((seg.data.len() as u64 + seg.offset, Marker::CodeLabel("<dummy-end-marker>".to_string())));
+    flat_map.push((seg.data.len() as u64 + seg.offset, Marker::CodeLabel(usize::MAX)));
 
     for n in 0..flat_map.len() - 1 {
         let (cur_offs, cur_marker) = &flat_map[n];
         let (next_offs, _next_marker) = &flat_map[n+1];
         if cur_marker.is_code() {
             let code = &seg.data[(*cur_offs - seg.offset) as usize..(*next_offs - seg.offset) as usize];
-            print_code(&args, &cs, target, &seg, &code, *cur_offs, &seg.markers);
+            print_code(&args, &cs, target, &seg, &code, *cur_offs);
         } else if cur_marker.is_data() {
-            if let Some(label) = find_label(&seg.markers, *cur_offs) {
+            if let Some(label) = find_label(seg, *cur_offs) {
                 println!("{}:", label);
             }
 
@@ -680,7 +694,8 @@ fn identify_code<'a>(cs: &Capstone, seg: &mut Segment, insns: &capstone::Instruc
         if is_branch(i) {
             assert!(ops.len() == 1);
             if let Some(value) = get_op_imm(get_x86_op(&ops[0])) {
-                seg.markers.insert(value, Marker::CodeLabel(generate_code_label(seg, value)));
+                let label_idx = use_label(seg, Label::Code(value));
+                seg.markers.insert(value, Marker::CodeLabel(label_idx));
             }
             continue;
         }
@@ -795,7 +810,8 @@ fn load_executable(_args: &Cli, file_content: Vec<u8>) -> Result<Target> {
     // Create initial entry point marker
     let init_seg_idx = offsets.iter().position(|&v| v == info.header.init_cs).unwrap();
     let init_seg = &mut target.segments[init_seg_idx];
-    init_seg.markers.insert(info.header.init_ip as u64, Marker::CodeLabel("entry".to_string()));
+    let label_idx = use_label(init_seg, Label::Entry);
+    init_seg.markers.insert(info.header.init_ip as u64, Marker::CodeLabel(label_idx));
     Ok(target)
 }
 
@@ -884,7 +900,8 @@ fn main() -> Result<()> {
                 for rf in refs {
                     match rf {
                         SegmentReference::Code(_, off) => {
-                            seg.markers.insert(*off, Marker::CodeLabel(generate_code_label(seg, *off)));
+                            let label_idx = use_label(seg, Label::Code(*off));
+                            seg.markers.insert(*off, Marker::CodeLabel(label_idx));
                         }
                     }
                 }
